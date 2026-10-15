@@ -122,3 +122,22 @@ for t in range(epochs):
     train_loop(train_dataloader, model, loss_fn, optimizer)
     test_loop(test_dataloader, model, loss_fn)
 print("Done!")
+
+
+#================ SECTION 5: Saving the model and test cases==========================
+
+#save the trained weights
+torch.save(model.state_dict(), "models/mnist_mlp.pth")
+print("Saved model weights to models/mnist_mlp.pth")
+
+#save one batch of test images and the model's outputs as the answer key for the interpreter
+model.eval()
+with torch.no_grad():
+    test_images, test_labels = next(iter(test_dataloader))
+    test_images = test_images.to(device)
+    test_outputs = model(test_images)
+
+np.save("models/test_images.npy", test_images.cpu().numpy())
+np.save("models/test_labels.npy", test_labels.numpy())
+np.save("models/test_outputs.npy", test_outputs.cpu().numpy())
+print("Saved test images, labels, and outputs to models/")

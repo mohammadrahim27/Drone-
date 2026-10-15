@@ -17,3 +17,7 @@ disp("Electronics current (battery-side): " + bc + "A")
 disp("Total hover current: " + total_current + "A")
 disp("Current drawn at thrust cap: " + tcc + "A")
 disp("Flight time: " + flight_time + "min")
+
+
+
+torch.save
