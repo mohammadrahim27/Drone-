@@ -44,25 +44,28 @@ print(f"Using device: {device}")
 class NeuralNetwork(nn.Module):
     def __init__(self):
         super().__init__()
-        self.flatten = nn.Flatten()
-        self.linear_relu_stack = nn.Sequential(
-            nn.Linear(28*28, 512),
-            nn.ReLU(), 
-            nn.Linear(512, 512),
+        self.conv_stack = nn.Sequential(
+            nn.Conv2d(1, 8, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Linear(512, 10)
+            nn.MaxPool2d(2),
+            nn.Conv2d(8, 16, kernel_size=3, padding=1),
+            nn.ReLU(), 
+            nn.MaxPool2d(2),
+            nn.Flatten(),
+            nn.Linear(16*7*7, 10)
         )
 
+
+
     def forward(self, x):
-        x = self.flatten(x)
-        logits = self.linear_relu_stack(x)
+        logits = self.conv_stack(x)
         return logits
 
 model = NeuralNetwork().to(device)
 print(model)
 
 
-X = torch.rand(1, 28, 28, device=device)
+X = torch.rand(1, 1, 28, 28, device=device)
 logits = model(X)
 pred_probabilities = nn.Softmax(dim=1)(logits)
 y_pred = pred_probabilities.argmax(dim=1)
