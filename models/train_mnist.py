@@ -4,6 +4,8 @@ import onnxruntime as ort
 from torchvision import datasets
 from torchvision.transforms import v2
 import torch.nn as nn
+import onnx
+
 
 
 
@@ -144,3 +146,31 @@ np.save("models/test_images.npy", test_images.cpu().numpy())
 np.save("models/test_labels.npy", test_labels.numpy())
 np.save("models/test_outputs.npy", test_outputs.cpu().numpy())
 print("Saved test images, labels, and outputs to models/")
+
+
+
+#================ SECTION 6: Exporting the model to ONNX format==========================
+model.eval()
+dummy_input = torch.randn(1, 1, 28, 28, device=device)
+
+
+torch.onnx.export(
+    model, 
+    (dummy_input,),
+    "models/mnist_cnn.onnx",
+    input_names=["images"],
+    output_names=["logits"],
+)
+
+#checking to see if the file is valid on ONNX file
+onnx_model = onnx.load("models/mnist_cnn.onnx")
+onnx.checker.check_model(onnx_model)
+
+
+#check to see if ONNX Runtime gives the same answer as the PyTorch model on one test image
+session = ort.InferenceSession("models/mnist_cnn.onnx")
+one_image = test_images[0:1].cpu().numpy()
+onnx_output = session.run(None, {"image": one_image})[0]
+torch_output = test_outputs[0:1].cpu().numpy()
+np.testing.assert_allclose(onnx_output, torch_output, rtol=1e-4, atol=1e-5)
+print("ONNX Runtime output matches PyTorch")
