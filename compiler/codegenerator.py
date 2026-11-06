@@ -14,6 +14,9 @@ KERNELS = r"""
 #include <stdlib.h>
 #include <string.h>
 #include <float.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* portable SIMD: a vector of VEC_WIDTH floats. gcc turns vf math into AVX / AVX-512
    on x86 and NEON on ARM (Jetson). The width is picked when the model is compiled. */
@@ -335,12 +338,12 @@ def emit_conv_dense(idx, node, graph, ws):
    {NB} block(s) of {KB} filters, tile = {P} pixels x {KB} filters ({P * V} vector sums in registers) */
 {pad_decl}static void conv_layer{idx}(const float *x, float *y)
 {{
-    float tmp[{VEC}];
 {pad_body}
-    for (int nb = 0; nb < {NB}; nb++) {{
-        const float *wblk = {W_ptr} + nb * {T * KB};
-        const float *bias = {B_ptr} + nb * {KB};
+{omp(T * K * OH * OW, "parallel for collapse(2) schedule(runtime)")}    for (int nb = 0; nb < {NB}; nb++) {{
         for (int oh = 0; oh < {OH}; oh++) {{
+            const float *wblk = {W_ptr} + nb * {T * KB};
+            const float *bias = {B_ptr} + nb * {KB};
+            float tmp[{VEC}];
             for (int ow0 = 0; ow0 < {main_end}; ow0 += {P}) {{
 {tile(P)}
             }}"""
@@ -371,6 +374,19 @@ def vector_activation(node, var):
 
 
 MR = 6    # filters per micro-tile (the pixel side is 2 vectors)
+
+# layers with at least this many multiply-adds get split across CPU cores (OpenMP).
+# Smaller layers run on one core: starting threads would cost more than it saves.
+PARALLEL_MACS = 1_000_000
+
+
+def omp(macs, clause="parallel for schedule(runtime)"):
+    # schedule(runtime): HOW the work is shared between threads is picked when the program
+    # starts, from the OMP_SCHEDULE setting, so it can be tuned without recompiling:
+    #   static  = equal shares (best when all cores are the same speed)
+    #   guided  = threads grab chunks as they finish, big first then smaller
+    #   dynamic = threads grab small fixed chunks as they finish
+    return f"#pragma omp {clause}\n" if macs >= PARALLEL_MACS else ""
 
 
 def emit_conv_1x1(idx, node, graph, ws):
@@ -427,7 +443,7 @@ def emit_conv_1x1(idx, node, graph, ws):
 {tail_decl}static void conv_layer{idx}(const float *x, float *y)
 {{
     const float *wall = {W_ptr}, *ball = {B_ptr};
-    for (int p = 0; p < {full}; p += {NR})
+{omp(C * K * HW, "parallel for collapse(2) schedule(runtime)")}    for (int p = 0; p < {full}; p += {NR})
         for (int nb = 0; nb < {NB}; nb++) {{
 {micro("x + p", HW, "y + p", HW)}
         }}
@@ -437,7 +453,7 @@ def emit_conv_1x1(idx, node, graph, ws):
     /* last {rest} pixel(s): copy into a zero-padded block, run the same tile, copy back */
     for (int c = 0; c < {C}; c++)
         memcpy(TX{idx} + c * {NR}, x + c * {HW} + {full}, {rest} * sizeof(float));
-    for (int nb = 0; nb < {NB}; nb++) {{
+{omp(C * K * NR)}    for (int nb = 0; nb < {NB}; nb++) {{
 {micro(f"TX{idx}", NR, f"TY{idx}", NR, check_k=False)}
     }}
     for (int k = 0; k < {K}; k++)
@@ -459,7 +475,15 @@ def emit_conv_depthwise(idx, node, graph, ws):
         raise ValueError(f"grouped Conv with group={group} not supported (only depthwise)")
     if S not in (1, 2):
         raise ValueError("depthwise stride must be 1 or 2")
-    HP, WP, pad_decl, pad_body = padded_source(idx, C, H, W, pt, pl, pb, pr)
+    HP, WP = H + pt + pb, W + pl + pr
+    padded = any((pt, pl, pb, pr))
+    pad_decl = f"static float PAD{idx}[{C * HP * WP}];   /* zero-padded copy of this layer's input */\n" if padded else ""
+    if padded:
+        chan_src = f"""        float *xc = PAD{idx} + c * {HP * WP};             /* this channel, inside a zero border */
+        for (int h = 0; h < {H}; h++)
+            memcpy(xc + (h + {pt}) * {WP} + {pl}, x + (c * {H} + h) * {W}, {W} * sizeof(float));"""
+    else:
+        chan_src = f"        const float *xc = x + c * {HP * WP};"
     W_ptr, B_ptr = ws.add(w.reshape(C, KH * KW)), ws.add(b)
     vact, sact = vector_activation(node, "r"), activation(node, "s")
 
@@ -468,18 +492,17 @@ def emit_conv_depthwise(idx, node, graph, ws):
         def tap(i, j):
             return f"xc + (oh + {i}) * {WP} + ow + {j}"
         prep = ""
-        decl = ""
     else:
         WE, WO = (WP + 1) // 2, WP // 2                       # even / odd column counts
-        decl = f"static float EV{idx}[{HP * WE}], OD{idx}[{HP * max(WO, 1)}];   /* even / odd columns */\n"
-        prep = f"""        for (int h = 0; h < {HP}; h++) {{                 /* split rows into even and odd columns */
+        prep = f"""        float EV[{HP * WE}], OD[{HP * max(WO, 1)}];        /* this channel's even / odd columns */
+        for (int h = 0; h < {HP}; h++) {{
             const float *row = xc + h * {WP};
-            for (int q = 0; q < {WE}; q++) EV{idx}[h * {WE} + q] = row[2 * q];
-            for (int q = 0; q < {WO}; q++) OD{idx}[h * {WO} + q] = row[2 * q + 1];
+            for (int q = 0; q < {WE}; q++) EV[h * {WE} + q] = row[2 * q];
+            for (int q = 0; q < {WO}; q++) OD[h * {WO} + q] = row[2 * q + 1];
         }}
 """
         def tap(i, j):
-            arr, width = (f"EV{idx}", WE) if j % 2 == 0 else (f"OD{idx}", WO)
+            arr, width = ("EV", WE) if j % 2 == 0 else ("OD", WO)
             return f"{arr} + (2 * oh + {i}) * {width} + ow + {j // 2}"
 
     T = KH * KW
@@ -492,12 +515,11 @@ def emit_conv_depthwise(idx, node, graph, ws):
 
     return f"""
 /* {node.op_type} depthwise layer {idx}: {C}x{H}x{W} -> {K}x{OH}x{OW}, {KH}x{KW} filter, stride {S} */
-{pad_decl}{decl}static void conv_layer{idx}(const float *x, float *y)
+{pad_decl}static void conv_layer{idx}(const float *x, float *y)
 {{
-{pad_body}
     const float *wall = {W_ptr}, *wb = {B_ptr};
-    for (int c = 0; c < {C}; c++) {{
-        const float *xc = src + c * {HP * WP};
+{omp(T * C * OH * OW * 4)}    for (int c = 0; c < {C}; c++) {{
+{chan_src}
         const float *wc = wall + c * {T};
         float *yc = y + c * {OH * OW};
         const vf bias = SPLAT(wb[c]);
@@ -551,8 +573,8 @@ def emit_gemm(idx, node, graph, ws):
 /* Gemm layer {idx}: {K} inputs -> {N} outputs, in {NB} block(s) of {NBK} outputs */
 static void gemm_layer{idx}(const float *x, float *y)
 {{
-    float tmp[{NBK}];
-    for (int nb = 0; nb < {NB}; nb++) {{
+{omp(K * N)}    for (int nb = 0; nb < {NB}; nb++) {{
+        float tmp[{NBK}];
         const float *wblk = {W_ptr} + nb * {K * NBK};
         const float *bias = {B_ptr} + nb * {NBK};"""]
     for v in range(VB):
@@ -696,7 +718,15 @@ static void load_weights(void)
 
     out.append("\n/* ---------- the model, one step per node ---------- */")
     out.append("void model_run(const float *input, float *output)\n{")
-    out.append("    static int loaded = 0;\n    if (!loaded) { load_weights(); loaded = 1; }\n")
+    out.append("""    static int loaded = 0;
+    if (!loaded) {
+        load_weights();
+#ifdef _OPENMP
+        if (!getenv("OMP_SCHEDULE")) omp_set_schedule(omp_sched_static, 0);   /* default: equal shares */
+#endif
+        loaded = 1;
+    }
+""")
     out.extend(body)
     out.append("}")
     return "\n".join(out) + "\n"
@@ -730,8 +760,13 @@ def build(model_path, build_dir, fast=True, exe_name="model.exe", kernel=None):
 
     exe = build_dir / exe_name
     flags = ["-O3", "-march=native"] + (["-DFAST_CONV"] if kernel == "fast" else [])
-    subprocess.run(["gcc", *flags, "-o", str(exe),
-                    str(build_dir / "model.c"), str(build_dir / "main.c")], check=True)
+    sources = [str(build_dir / "model.c"), str(build_dir / "main.c")]
+    result = subprocess.run(["gcc", *flags, "-fopenmp", "-o", str(exe), *sources],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        # most likely OpenMP isn't installed: build a single-core version instead
+        print("note: building without OpenMP (multi-core) support:", result.stderr.strip().splitlines()[-1:])
+        subprocess.run(["gcc", *flags, "-o", str(exe), *sources], check=True)
     return graph, exe
 
 

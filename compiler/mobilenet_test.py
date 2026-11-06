@@ -1,4 +1,6 @@
+import os
 import sys
+import subprocess
 import numpy as np
 from pathlib import Path
 import onnxruntime as ort
@@ -6,6 +8,22 @@ from codegenerator import build
 import fair_bench_comparison as fb
 
 RUNS = 30            # MobileNetV2 takes milliseconds, not microseconds, so fewer runs
+THREADS = [1, 2, 4, 6, 8, 12]
+SCHEDULES = ["static", "guided", "dynamic,4"]
+
+
+def time_ours(exe, input_path, threads, schedule="static"):
+    # our program uses OpenMP: OMP_NUM_THREADS sets how many cores it may use,
+    # OMP_SCHEDULE sets how the work is shared between them
+    env = dict(os.environ)
+    env["OMP_SCHEDULE"] = schedule
+    if threads:
+        env["OMP_NUM_THREADS"] = str(threads)
+    else:
+        env.pop("OMP_NUM_THREADS", None)
+    out = subprocess.run([str(exe), str(input_path), str(RUNS)], capture_output=True,
+                         text=True, check=True, env=env).stdout
+    return float(out)
 
 
 def make_input(root, shape):
@@ -46,16 +64,30 @@ if __name__ == "__main__":
     # ---- speed: both timed in C, same stopwatch ----
     # laptops are noisy: run each 3 times and keep the best
     ort_exe = fb.build_ort_bench(graph, fb.get_onnxruntime(root / "tools"), build_dir)
-    ours_us = min([ours_us] + [fb.run_ours(exe, input_path)[0] for _ in range(2)])
+    print()
+    print("Thread sweep for our compiler, ms per image (best of 3 each):")
+    print("  threads " + "".join(f"{sc:>12}" for sc in SCHEDULES))
+    sweep = {}
+    for t in THREADS:
+        row = []
+        for sc in (SCHEDULES if t > 1 else ["static"]):
+            sweep[(t, sc)] = min(time_ours(exe, input_path, t, sc) for _ in range(3))
+            row.append(f"{sweep[(t, sc)] / 1000:>12.2f}")
+        print(f"  {t:>7} " + "".join(row))
+    best = min(sweep, key=sweep.get)
+    best_t = f"{best[0]} threads, {best[1]}"
+    ours1_us, oursn_us = sweep[(1, "static")], sweep[best]
+    print(f"  fastest: {best_t}")
     ort1_us = min(fb.run_ort(ort_exe, model_path, input_path, graph, threads=1)[0] for _ in range(3))
     ortn_us = min(fb.run_ort(ort_exe, model_path, input_path, graph, threads=0)[0] for _ in range(3))
 
     print()
-    print(f"{'version (best of 3)':<30}{'time per image':>16}")
-    print(f"{'Our compiler (1 core)':<30}{ours_us / 1000:>13.2f} ms")
-    print(f"{'ONNX Runtime (1 core)':<30}{ort1_us / 1000:>13.2f} ms")
-    print(f"{'ONNX Runtime (all cores)':<30}{ortn_us / 1000:>13.2f} ms")
-    r = ort1_us / ours_us
+    print(f"{'version (best of 3)':<30}{'1 core':>12}{'multi-core':>12}")
+    print(f"{'Our compiler':<30}{ours1_us / 1000:>9.2f} ms{oursn_us / 1000:>9.2f} ms")
+    print(f"{'ONNX Runtime':<30}{ort1_us / 1000:>9.2f} ms{ortn_us / 1000:>9.2f} ms")
     print()
-    print(f"Same number of cores: " + (f"our compiler is {r:.2f}x faster" if r >= 1
-                                       else f"ONNX Runtime is {1 / r:.2f}x faster"))
+    print(f"(multi-core: ours with {best_t}, ONNX Runtime with its own choice)")
+    for label, ours, theirs in [("1 core", ours1_us, ort1_us), ("multi-core", oursn_us, ortn_us)]:
+        r = theirs / ours
+        print(f"{label + ':':<12}" + (f"our compiler is {r:.2f}x faster" if r >= 1
+                                     else f"ONNX Runtime is {1 / r:.2f}x faster"))
