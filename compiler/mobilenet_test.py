@@ -12,11 +12,14 @@ THREADS = [1, 2, 4, 6, 8, 12]
 SCHEDULES = ["static", "guided", "dynamic,4"]
 
 
-def time_ours(exe, input_path, threads, schedule="static"):
+def time_ours(exe, input_path, threads, schedule=None):
     # our program uses OpenMP: OMP_NUM_THREADS sets how many cores it may use,
     # OMP_SCHEDULE sets how the work is shared between them
     env = dict(os.environ)
-    env["OMP_SCHEDULE"] = schedule
+    if schedule:
+        env["OMP_SCHEDULE"] = schedule
+    else:
+        env.pop("OMP_SCHEDULE", None)
     if threads:
         env["OMP_NUM_THREADS"] = str(threads)
     else:
@@ -76,8 +79,14 @@ if __name__ == "__main__":
         print(f"  {t:>7} " + "".join(row))
     best = min(sweep, key=sweep.get)
     best_t = f"{best[0]} threads, {best[1]}"
-    ours1_us, oursn_us = sweep[(1, "static")], sweep[best]
     print(f"  fastest: {best_t}")
+
+    # bake the winning setting into the program, then time it with NO settings at all
+    print(f"\nRebuilding with {best_t} as the built-in default ...")
+    graph, exe = build(model_path, build_dir, exe_name="mobilenet.exe", threads=best[0], schedule=best[1])
+    tuned_us = min(time_ours(exe, input_path, 0, None) for _ in range(3))
+    print(f"  tuned program, no settings: {tuned_us / 1000:.2f} ms")
+    ours1_us, oursn_us = sweep[(1, "static")], tuned_us
     ort1_us = min(fb.run_ort(ort_exe, model_path, input_path, graph, threads=1)[0] for _ in range(3))
     ortn_us = min(fb.run_ort(ort_exe, model_path, input_path, graph, threads=0)[0] for _ in range(3))
 
@@ -86,7 +95,7 @@ if __name__ == "__main__":
     print(f"{'Our compiler':<30}{ours1_us / 1000:>9.2f} ms{oursn_us / 1000:>9.2f} ms")
     print(f"{'ONNX Runtime':<30}{ort1_us / 1000:>9.2f} ms{ortn_us / 1000:>9.2f} ms")
     print()
-    print(f"(multi-core: ours with {best_t}, ONNX Runtime with its own choice)")
+    print(f"(multi-core: ours tuned to {best_t}, ONNX Runtime with its own choice)")
     for label, ours, theirs in [("1 core", ours1_us, ort1_us), ("multi-core", oursn_us, ortn_us)]:
         r = theirs / ours
         print(f"{label + ':':<12}" + (f"our compiler is {r:.2f}x faster" if r >= 1

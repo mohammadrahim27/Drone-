@@ -268,14 +268,13 @@ def padded_source(idx, C, H, W, pt, pl, pb, pr):
     """Code that gives the layer a zero-padded copy of its input (or the input itself if no padding)."""
     HP, WP = H + pt + pb, W + pl + pr
     if pt == pl == pb == pr == 0:
-        return HP, WP, "", "    const float *src = x;"
+        return HP, WP, "", "", "    const float *src = x;"
     decl = f"static float PAD{idx}[{C * HP * WP}];   /* zero-padded copy of this layer's input */\n"
-    body = f"""    for (int c = 0; c < {C}; c++)                       /* copy input inside the zero border */
+    copy = f"""    for (int c = 0; c < {C}; c++)                       /* copy input inside the zero border */
         for (int h = 0; h < {H}; h++)
             memcpy(&PAD{idx}[(c * {HP} + h + {pt}) * {WP} + {pl}], &x[(c * {H} + h) * {W}],
-                   {W} * sizeof(float));
-    const float *src = PAD{idx};"""
-    return HP, WP, decl, body
+                   {W} * sizeof(float));"""
+    return HP, WP, decl, copy, f"    const float *src = PAD{idx};"
 
 
 def emit_conv_dense(idx, node, graph, ws):
@@ -287,7 +286,7 @@ def emit_conv_dense(idx, node, graph, ws):
     The code for a tile is written out fully unrolled by this Python code.
     """
     C, H, W, K, OH, OW, w, b, KH, KW, pt, pl, pb, pr, S, _ = conv_params(node, graph)
-    HP, WP, pad_decl, pad_body = padded_source(idx, C, H, W, pt, pl, pb, pr)
+    HP, WP, pad_decl, pad_copy, src_line = padded_source(idx, C, H, W, pt, pl, pb, pr)
 
     KB = VEC if K <= VEC else 2 * VEC         # filters per block
     V = KB // VEC                             # vectors per block
@@ -338,8 +337,9 @@ def emit_conv_dense(idx, node, graph, ws):
    {NB} block(s) of {KB} filters, tile = {P} pixels x {KB} filters ({P * V} vector sums in registers) */
 {pad_decl}static void conv_layer{idx}(const float *x, float *y)
 {{
-{pad_body}
-{omp(T * K * OH * OW, "parallel for collapse(2) schedule(runtime)")}    for (int nb = 0; nb < {NB}; nb++) {{
+{single(T * K * OH * OW, pad_copy)}
+{src_line}
+{omp(T * K * OH * OW, "for collapse(2) schedule(runtime)")}    for (int nb = 0; nb < {NB}; nb++) {{
         for (int oh = 0; oh < {OH}; oh++) {{
             const float *wblk = {W_ptr} + nb * {T * KB};
             const float *bias = {B_ptr} + nb * {KB};
@@ -380,13 +380,23 @@ MR = 6    # filters per micro-tile (the pixel side is 2 vectors)
 PARALLEL_MACS = 1_000_000
 
 
-def omp(macs, clause="parallel for schedule(runtime)"):
+def omp(macs, clause="for schedule(runtime)"):
     # schedule(runtime): HOW the work is shared between threads is picked when the program
     # starts, from the OMP_SCHEDULE setting, so it can be tuned without recompiling:
     #   static  = equal shares (best when all cores are the same speed)
     #   guided  = threads grab chunks as they finish, big first then smaller
     #   dynamic = threads grab small fixed chunks as they finish
+    # The whole model runs inside ONE team of threads (started once per image).
+    # Big layers split their loops across that team with "omp for".
     return f"#pragma omp {clause}\n" if macs >= PARALLEL_MACS else ""
+
+
+def single(macs, code):
+    # inside a big layer, a step that must run once (e.g. a copy) is done by one thread;
+    # the others wait for it at the end of the "single" block
+    if macs >= PARALLEL_MACS and code.strip():
+        return "#pragma omp single\n    {\n" + code + "\n    }"
+    return code
 
 
 def emit_conv_1x1(idx, node, graph, ws):
@@ -443,7 +453,7 @@ def emit_conv_1x1(idx, node, graph, ws):
 {tail_decl}static void conv_layer{idx}(const float *x, float *y)
 {{
     const float *wall = {W_ptr}, *ball = {B_ptr};
-{omp(C * K * HW, "parallel for collapse(2) schedule(runtime)")}    for (int p = 0; p < {full}; p += {NR})
+{omp(C * K * HW, "for collapse(2) schedule(runtime)")}    for (int p = 0; p < {full}; p += {NR})
         for (int nb = 0; nb < {NB}; nb++) {{
 {micro("x + p", HW, "y + p", HW)}
         }}
@@ -451,12 +461,12 @@ def emit_conv_1x1(idx, node, graph, ws):
     if rest:
         code += f"""
     /* last {rest} pixel(s): copy into a zero-padded block, run the same tile, copy back */
-    for (int c = 0; c < {C}; c++)
-        memcpy(TX{idx} + c * {NR}, x + c * {HW} + {full}, {rest} * sizeof(float));
-{omp(C * K * NR)}    for (int nb = 0; nb < {NB}; nb++) {{
+{single(C * K * HW, f"""    for (int c = 0; c < {C}; c++)
+        memcpy(TX{idx} + c * {NR}, x + c * {HW} + {full}, {rest} * sizeof(float));""")}
+{omp(C * K * HW)}    for (int nb = 0; nb < {NB}; nb++) {{
 {micro(f"TX{idx}", NR, f"TY{idx}", NR, check_k=False)}
     }}
-    for (int k = 0; k < {K}; k++)
+{omp(C * K * HW)}    for (int k = 0; k < {K}; k++)
         memcpy(y + k * {HW} + {full}, TY{idx} + k * {NR}, {rest} * sizeof(float));
 """
     code += "}\n"
@@ -594,9 +604,14 @@ static void gemm_layer{idx}(const float *x, float *y)
     return "\n".join(L)
 
 
-def generate_c(graph, assignment, buffers, kernel, weights_file, ws):
+SCHED_KINDS = {"static": "omp_sched_static", "dynamic": "omp_sched_dynamic", "guided": "omp_sched_guided"}
+
+
+def generate_c(graph, assignment, buffers, kernel, weights_file, ws, threads=None, schedule="dynamic,4"):
     numel = lambda name: math.prod(graph.shapes[name])
     buf = lambda name: f"B{assignment[name]}"
+    once = lambda: "    #pragma omp single\n"          # run this step on one thread
+    split = lambda: "    #pragma omp for\n"            # split this loop across the team
     splat = "static inline vf SPLAT(float f) { vf v = {" + ", ".join(["f"] * VEC) + "}; return v; }"
     out = ["/* generated by codegenerator.py -- do not edit by hand */",
            f"#define VEC_WIDTH {VEC}", KERNELS.replace("SPLAT_DEFINITION", splat)]
@@ -604,7 +619,7 @@ def generate_c(graph, assignment, buffers, kernel, weights_file, ws):
     body = []
 
     in_name, out_name = graph.inputs[0], graph.outputs[0]
-    body.append(f"    memcpy({buf(in_name)}, input, {numel(in_name)} * sizeof(float));")
+    body.append(once() + f"    memcpy({buf(in_name)}, input, {numel(in_name)} * sizeof(float));")
 
     for idx, node in enumerate(graph.nodes):
         x, y = node.inputs[0], node.outputs[0]
@@ -623,7 +638,8 @@ def generate_c(graph, assignment, buffers, kernel, weights_file, ws):
                 layer_code.append(emit_conv_dense(idx, node, graph, ws))
             else:
                 layer_code.append(emit_conv_depthwise(idx, node, graph, ws))
-            body.append(f"    conv_layer{idx}({buf(x)}, {buf(y)});")
+            par = "#pragma omp" in layer_code[-1]
+            body.append(("" if par else once()) + f"    conv_layer{idx}({buf(x)}, {buf(y)});")
 
         elif op in ("Conv", "ConvRelu"):                   # original kernels (naive / fast)
             if a.get("group", 1) != 1:
@@ -634,29 +650,30 @@ def generate_c(graph, assignment, buffers, kernel, weights_file, ws):
             ws_shape = graph.shapes[w_name]
             pads = a.get("pads", [0, 0, 0, 0])
             stride = a.get("strides", [1, 1])[0]
-            body.append(f"    CONV({buf(x)}, {xs[1]}, {xs[2]}, {xs[3]}, "
+            body.append(once() + f"    CONV({buf(x)}, {xs[1]}, {xs[2]}, {xs[3]}, "
                         f"{c_name(w_name)}, {c_name(b_name)}, {ws_shape[0]}, {ws_shape[2]}, {ws_shape[3]}, "
                         f"{pads[0]}, {pads[1]}, {stride}, {1 if op == 'ConvRelu' else 0}, "
                         f"{buf(y)}, {ys[2]}, {ys[3]});")
 
         elif op == "Gemm" and kernel == "special":
             layer_code.append(emit_gemm(idx, node, graph, ws))
-            body.append(f"    gemm_layer{idx}({buf(x)}, {buf(y)});")
+            par = "#pragma omp" in layer_code[-1]
+            body.append(("" if par else once()) + f"    gemm_layer{idx}({buf(x)}, {buf(y)});")
 
         elif op == "Gemm":
             w_name, b_name = node.inputs[1], node.inputs[2]
             layer_code.append(f"#define {c_name(w_name)} {ws.add(graph.weights[w_name])}")
             layer_code.append(f"#define {c_name(b_name)} {ws.add(graph.weights[b_name])}")
-            body.append(f"    gemm({buf(x)}, {xs[1]}, {c_name(w_name)}, {c_name(b_name)}, "
+            body.append(once() + f"    gemm({buf(x)}, {xs[1]}, {c_name(w_name)}, {c_name(b_name)}, "
                         f"{ys[1]}, {a.get('transB', 0)}, {buf(y)});")
 
         elif op == "Relu":
-            body.append(f"    for (int i = 0; i < {numel(x)}; i++) "
+            body.append(split() + f"    for (int i = 0; i < {numel(x)}; i++) "
                         f"{{ float r = {buf(x)}[i]; if (r < 0.0f) r = 0.0f; {buf(y)}[i] = r; }}")
 
         elif op == "Clip":
             lo, hi = clip_bounds(node, graph)
-            body.append(f"    for (int i = 0; i < {numel(x)}; i++) {{ float r = {buf(x)}[i]; "
+            body.append(split() + f"    for (int i = 0; i < {numel(x)}; i++) {{ float r = {buf(x)}[i]; "
                         f"if (r < {cfloat(lo)}) r = {cfloat(lo)}; if (r > {cfloat(hi)}) r = {cfloat(hi)}; "
                         f"{buf(y)}[i] = r; }}")
 
@@ -664,13 +681,13 @@ def generate_c(graph, assignment, buffers, kernel, weights_file, ws):
             x2 = node.inputs[1]
             if graph.shapes[x2] != xs:
                 raise ValueError("Add with broadcasting not supported yet")
-            body.append(f"    for (int i = 0; i < {numel(x)}; i++) "
+            body.append(split() + f"    for (int i = 0; i < {numel(x)}; i++) "
                         f"{buf(y)}[i] = {buf(x)}[i] + {buf(x2)}[i];")
 
         elif op == "MaxPool":
             k = a["kernel_shape"][0]
             stride = a.get("strides", a["kernel_shape"])[0]
-            body.append(f"    maxpool2d({buf(x)}, {xs[1]}, {xs[2]}, {xs[3]}, {k}, {stride}, "
+            body.append(once() + f"    maxpool2d({buf(x)}, {xs[1]}, {xs[2]}, {xs[3]}, {k}, {stride}, "
                         f"{buf(y)}, {ys[2]}, {ys[3]});")
 
         elif op in ("ReduceMean", "GlobalAveragePool"):
@@ -679,19 +696,19 @@ def generate_c(graph, assignment, buffers, kernel, weights_file, ws):
                 if reduce_axes(node, graph, len(xs)) != [2, 3]:
                     raise ValueError("ReduceMean only supported over height and width")
             hw = xs[2] * xs[3]
-            body.append(f"    for (int c = 0; c < {xs[1]}; c++) {{ float s = 0.0f; "
+            body.append(split() + f"    for (int c = 0; c < {xs[1]}; c++) {{ float s = 0.0f; "
                         f"for (int i = 0; i < {hw}; i++) s += {buf(x)}[c * {hw} + i]; "
                         f"{buf(y)}[c] = s / {hw}.0f; }}")
 
         elif op in ("Reshape", "Flatten"):
             # same numbers, new layout: just copy if the planner gave it a different buffer
             if buf(x) != buf(y):
-                body.append(f"    memcpy({buf(y)}, {buf(x)}, {numel(x)} * sizeof(float));")
+                body.append(once() + f"    memcpy({buf(y)}, {buf(x)}, {numel(x)} * sizeof(float));")
 
         else:
             raise ValueError("No C code for op: " + op)
 
-    body.append(f"\n    memcpy(output, {buf(out_name)}, {numel(out_name)} * sizeof(float));")
+    body.append("\n" + once() + f"    memcpy(output, {buf(out_name)}, {numel(out_name)} * sizeof(float));")
 
     # all weights live in one array, loaded from weights.bin the first time the model runs
     path = Path(weights_file).resolve().as_posix().replace('"', '\\"')
@@ -718,21 +735,36 @@ static void load_weights(void)
 
     out.append("\n/* ---------- the model, one step per node ---------- */")
     out.append("void model_run(const float *input, float *output)\n{")
-    out.append("""    static int loaded = 0;
-    if (!loaded) {
+    kind, _, chunk = schedule.partition(",")
+    n_threads = str(threads) if threads else "(omp_get_num_procs() + 1) / 2"
+    team = any("#pragma omp" in code for code in layer_code)
+    out.append(f"""    static int loaded = 0;
+    if (!loaded) {{
         load_weights();
 #ifdef _OPENMP
-        if (!getenv("OMP_SCHEDULE")) omp_set_schedule(omp_sched_static, 0);   /* default: equal shares */
+        /* tuned defaults (used unless OMP_NUM_THREADS / OMP_SCHEDULE are set) */
+        if (!getenv("OMP_NUM_THREADS")) omp_set_num_threads({n_threads});
+        if (!getenv("OMP_SCHEDULE")) omp_set_schedule({SCHED_KINDS[kind]}, {chunk or 0});
 #endif
         loaded = 1;
-    }
+    }}
 """)
-    out.extend(body)
+    if team:
+        out.append("    /* one team of threads runs the whole model; each step either splits its loops")
+        out.append("       across the team (omp for) or runs on one thread (omp single) */")
+        out.append("    #pragma omp parallel\n    {")
+        out.extend("    " + line if line.strip() else line for chunk_ in body for line in chunk_.split("\n"))
+        out.append("    }")
+    else:
+        out.extend(body)
     out.append("}")
     return "\n".join(out) + "\n"
 
 
-def build(model_path, build_dir, fast=True, exe_name="model.exe", kernel=None):
+def build(model_path, build_dir, fast=True, exe_name="model.exe", kernel=None,
+          threads=None, schedule="dynamic,4"):
+    # threads / schedule: the default multi-core settings baked into the program
+    # (pick them by running the sweep in mobilenet_test.py)
     # kernel: "naive" (original), "fast" (row-sweep), "special" (per-layer SIMD)
     if kernel is None:
         kernel = "special" if fast else "naive"
@@ -752,7 +784,8 @@ def build(model_path, build_dir, fast=True, exe_name="model.exe", kernel=None):
     # each program gets its own weights file (the kernels store weights in different layouts)
     weights_file = build_dir / (Path(exe_name).stem + "_weights.bin")
     ws = WeightStore()
-    (build_dir / "model.c").write_text(generate_c(graph, assignment, buffers, kernel, weights_file, ws))
+    (build_dir / "model.c").write_text(generate_c(graph, assignment, buffers, kernel, weights_file, ws,
+                                                  threads, schedule))
     ws.write(weights_file)
 
     main = MAIN_C.replace("INPUT_SIZE", str(in_size)).replace("OUTPUT_SIZE", str(out_size))
