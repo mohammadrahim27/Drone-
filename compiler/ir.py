@@ -1,5 +1,6 @@
 import math
 import onnx
+import numpy as np
 from onnx import numpy_helper
 from pathlib import Path
 
@@ -20,6 +21,7 @@ class Graph:
         self.inputs = inputs            # list of names, e.g. ["images"]
         self.outputs = outputs          # list of names, e.g. ["logits"]
         self.shapes = {}                # dict: tensor name -> shape tuple
+        self.input_shapes = {}          # dict: input name -> shape, read from the ONNX file
 
 
 def from_onnx(path):
@@ -40,7 +42,12 @@ def from_onnx(path):
     inputs = [i.name for i in g.input if i.name not in weights]
     outputs = [o.name for o in g.output]
 
-    return Graph(nodes, weights, inputs, outputs)
+    graph = Graph(nodes, weights, inputs, outputs)
+    for i in g.input:
+        if i.name in inputs:
+            dims = [d.dim_value for d in i.type.tensor_type.shape.dim]
+            graph.input_shapes[i.name] = tuple(dims)
+    return graph
 
 
 # ---------- shape inference ----------
@@ -50,10 +57,23 @@ def window_out(size, k, pad_begin, pad_end, stride):
     return (size + pad_begin + pad_end - k) // stride + 1
 
 
-def infer_shapes(graph, input_shape):
+def reduce_axes(node, graph, rank):
+    # ReduceMean's axes are an attribute in old ONNX versions, an input in new ones
+    if "axes" in node.attributes:
+        axes = node.attributes["axes"]
+    elif len(node.inputs) > 1 and node.inputs[1]:
+        axes = graph.weights[node.inputs[1]].tolist()
+    else:
+        axes = list(range(rank))
+    return sorted(a % rank for a in axes)
+
+
+def infer_shapes(graph, input_shape=None):
     shapes = graph.shapes
 
     # known shapes to start: the image, and every weight
+    if input_shape is None:
+        input_shape = graph.input_shapes[graph.inputs[0]]
     shapes[graph.inputs[0]] = tuple(input_shape)
     for name, w in graph.weights.items():
         shapes[name] = tuple(w.shape)
@@ -63,15 +83,18 @@ def infer_shapes(graph, input_shape):
         attrs = node.attributes
 
         if node.op_type == "Conv":
-            w = shapes[node.inputs[1]]               # (out_ch, in_ch, kh, kw)
+            w = shapes[node.inputs[1]]               # (out_ch, in_ch / group, kh, kw)
             pads = attrs.get("pads", [0, 0, 0, 0])   # [top, left, bottom, right]
             strides = attrs.get("strides", [1, 1])
             h = window_out(x[2], w[2], pads[0], pads[2], strides[0])
             wd = window_out(x[3], w[3], pads[1], pads[3], strides[1])
             out = (x[0], w[0], h, wd)
 
-        elif node.op_type == "Relu":
+        elif node.op_type in ("Relu", "Clip"):
             out = x                                   # same shape
+
+        elif node.op_type == "Add":
+            out = tuple(np.broadcast_shapes(x, shapes[node.inputs[1]]))
 
         elif node.op_type == "MaxPool":
             k = attrs["kernel_shape"]
@@ -80,6 +103,20 @@ def infer_shapes(graph, input_shape):
             h = window_out(x[2], k[0], pads[0], pads[2], strides[0])
             wd = window_out(x[3], k[1], pads[1], pads[3], strides[1])
             out = (x[0], x[1], h, wd)
+
+        elif node.op_type == "ReduceMean":
+            axes = reduce_axes(node, graph, len(x))
+            if attrs.get("keepdims", 1):
+                out = tuple(1 if i in axes else d for i, d in enumerate(x))
+            else:
+                out = tuple(d for i, d in enumerate(x) if i not in axes)
+
+        elif node.op_type == "GlobalAveragePool":
+            out = (x[0], x[1], 1, 1)
+
+        elif node.op_type == "Flatten":
+            axis = attrs.get("axis", 1)
+            out = (math.prod(x[:axis]), math.prod(x[axis:]))
 
         elif node.op_type == "Reshape":
             target = [int(v) for v in graph.weights[node.inputs[1]]]
@@ -109,9 +146,11 @@ def infer_shapes(graph, input_shape):
 
 
 if __name__ == "__main__":
-    model_path = Path(__file__).parent.parent / "models" / "mnist_cnn.onnx"
+    import sys
+    name = sys.argv[1] if len(sys.argv) > 1 else "mnist_cnn.onnx"
+    model_path = Path(__file__).parent.parent / "models" / name
     graph = from_onnx(model_path)
-    infer_shapes(graph, (1, 1, 28, 28))
+    infer_shapes(graph)
 
     for node in graph.nodes:
         print(node.op_type, "->", node.outputs[0], node.shape)

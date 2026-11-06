@@ -3,25 +3,30 @@ import subprocess
 import numpy as np
 from pathlib import Path
 from ir import from_onnx, infer_shapes
-from passes import fuse_conv_relu
+from passes import fuse_conv_activation, clip_bounds
 from memplan import plan_memory, check_plan
 
 
-# ---------- the C kernels: one hand-written function per operation ----------
+# ---------- hand-written C kernels shared by every model ----------
 
 KERNELS = r"""
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <float.h>
 
-/* portable SIMD: gcc turns v8 math into AVX on x86 and NEON on ARM (Jetson) */
-typedef float v8 __attribute__((vector_size(32)));
-static inline v8 LOADV(const float *p) { v8 v; memcpy(&v, p, sizeof v); return v; }
-static inline void STOREV(float *p, v8 v) { memcpy(p, &v, sizeof v); }
-static inline v8 SPLAT(float f) { v8 v = {f, f, f, f, f, f, f, f}; return v; }
+/* portable SIMD: a vector of VEC_WIDTH floats. gcc turns vf math into AVX / AVX-512
+   on x86 and NEON on ARM (Jetson). The width is picked when the model is compiled. */
+typedef float vf __attribute__((vector_size(VEC_WIDTH * 4)));
+static inline vf LOADV(const float *p) { vf v; memcpy(&v, p, sizeof v); return v; }
+static inline void STOREV(float *p, vf v) { memcpy(p, &v, sizeof v); }
+SPLAT_DEFINITION
+typedef int vfi __attribute__((vector_size(VEC_WIDTH * 4)));
+static inline vf VMAX(vf a, vf b) { vfi m = a < b; return (vf)(((vfi)a & ~m) | ((vfi)b & m)); }
+static inline vf VMIN(vf a, vf b) { vfi m = a > b; return (vf)(((vfi)a & ~m) | ((vfi)b & m)); }
 
-/* Conv (optionally with ReLU fused in).
-   x: input  [C][H][W]      w: weights [K][C][kh][kw]      b: bias [K]
-   y: output [K][OH][OW]                                                   */
+/* Original Conv (kept for comparison).
+   x: input [C][H][W]   w: weights [K][C][kh][kw]   b: bias [K]   y: output [K][OH][OW] */
 static void conv2d(const float *x, int C, int H, int W,
                    const float *w, const float *b, int K, int kh, int kw,
                    int pad_t, int pad_l, int stride, int relu,
@@ -47,11 +52,7 @@ static void conv2d(const float *x, int C, int H, int W,
             }
 }
 
-/* Faster Conv. Same math, different loop order:
-   - for each filter weight, sweep it across a whole output row at once
-   - the innermost loop walks memory in a straight line, so the CPU can use
-     SIMD instructions (several multiply-adds in one instruction)
-   - edge checks are worked out once per row instead of once per multiply   */
+/* Row-sweep Conv (kept for comparison) */
 static void conv2d_fast(const float *x, int C, int H, int W,
                         const float *w, const float *b, int K, int kh, int kw,
                         int pad_t, int pad_l, int stride, int relu,
@@ -59,29 +60,22 @@ static void conv2d_fast(const float *x, int C, int H, int W,
 {
     for (int k = 0; k < K; k++) {
         float *yk = y + k * OH * OW;
-        for (int p = 0; p < OH * OW; p++) yk[p] = b[k];            /* start at bias */
-
+        for (int p = 0; p < OH * OW; p++) yk[p] = b[k];
         for (int c = 0; c < C; c++) {
             const float *xc = x + c * H * W;
             for (int i = 0; i < kh; i++)
                 for (int j = 0; j < kw; j++) {
                     float wv = w[((k * C + c) * kh + i) * kw + j];
                     int off = j - pad_l;
-
-                    /* only the columns where this weight lands inside the image */
                     int lo = 0, hi = OW;
                     while (lo < OW && lo * stride + off < 0) lo++;
                     while (hi > lo && (hi - 1) * stride + off >= W) hi--;
-
                     for (int oh = 0; oh < OH; oh++) {
                         int ih = oh * stride + i - pad_t;
                         if (ih < 0 || ih >= H) continue;
                         const float *xrow = xc + ih * W;
                         float *yrow = yk + oh * OW;
-                        if (stride == 1)
-                            for (int ow = lo; ow < hi; ow++) yrow[ow] += wv * xrow[ow + off];
-                        else
-                            for (int ow = lo; ow < hi; ow++) yrow[ow] += wv * xrow[ow * stride + off];
+                        for (int ow = lo; ow < hi; ow++) yrow[ow] += wv * xrow[ow * stride + off];
                     }
                 }
         }
@@ -90,7 +84,6 @@ static void conv2d_fast(const float *x, int C, int H, int W,
     }
 }
 
-/* pick which Conv the model uses: gcc -DFAST_CONV picks the fast one */
 #ifdef FAST_CONV
 #define CONV conv2d_fast
 #else
@@ -114,8 +107,7 @@ static void maxpool2d(const float *x, int C, int H, int W,
             }
 }
 
-/* Gemm: y[n] = b[n] + sum over k of x[k] * W(n, k)
-   transB = 1 means W is stored as [N][K], transB = 0 means [K][N]          */
+/* Original Gemm (kept for comparison) */
 static void gemm(const float *x, int K, const float *w, const float *b,
                  int N, int transB, float *y)
 {
@@ -125,12 +117,6 @@ static void gemm(const float *x, int K, const float *w, const float *b,
             sum += x[k] * (transB ? w[n * K + k] : w[k * N + n]);
         y[n] = sum;
     }
-}
-
-/* ReLU on its own (only used if a ReLU wasn't fused into a Conv) */
-static void relu(const float *x, int n, float *y)
-{
-    for (int i = 0; i < n; i++) y[i] = x[i] > 0.0f ? x[i] : 0.0f;
 }
 """
 
@@ -160,7 +146,7 @@ static double now_us(void)
 
 void model_run(const float *input, float *output);
 
-/* usage:  model input.bin          -> prints the 10 scores
+/* usage:  model input.bin          -> prints the scores
            model input.bin 1000     -> runs 1000 times, prints average microseconds per run */
 int main(int argc, char **argv)
 {
@@ -176,7 +162,7 @@ int main(int argc, char **argv)
 
     if (argc >= 3) {
         int runs = atoi(argv[2]);
-        for (int r = 0; r < 20; r++) model_run(input, output);      /* warm up */
+        for (int r = 0; r < 5; r++) model_run(input, output);       /* warm up (also loads weights) */
         double t0 = now_us();
         for (int r = 0; r < runs; r++) model_run(input, output);
         double t1 = now_us();
@@ -191,12 +177,15 @@ int main(int argc, char **argv)
 """
 
 
-def cf(v):
-    # a valid C float literal: 0.5 -> "0.5f", 0 -> "0.0f", 1e-05 -> "1e-05f"
-    t = f"{float(v):.9g}"
-    if "." not in t and "e" not in t:
-        t += ".0"
-    return t + "f"
+VEC = 8   # floats per SIMD vector: 8 (AVX2 / NEON) or 16 (AVX-512); set by detect_vector_width()
+
+
+def detect_vector_width():
+    """Ask gcc what this CPU supports. AVX-512 -> 16 floats per vector, otherwise 8."""
+    import os
+    out = subprocess.run(["gcc", "-march=native", "-dM", "-E", "-x", "c", os.devnull],
+                         capture_output=True, text=True).stdout
+    return 16 if "__AVX512F__" in out else 8
 
 
 def c_name(name):
@@ -204,251 +193,538 @@ def c_name(name):
     return "W_" + "".join(ch if ch.isalnum() else "_" for ch in name)
 
 
-def emit_weights(graph, names):
-    lines = []
-    for name in names:
-        arr = graph.weights[name].astype(np.float32).ravel()
-        values = ", ".join(cf(v) for v in arr)
-        lines.append(f"static const float {c_name(name)}[{arr.size}] = {{{values}}};")
-    return "\n".join(lines)
+def cfloat(v):
+    # a valid C float literal for any value, including infinity
+    if v == float("inf"):
+        return "FLT_MAX"
+    if v == float("-inf"):
+        return "-FLT_MAX"
+    t = f"{float(v):.9g}"
+    if "." not in t and "e" not in t:
+        t += ".0"
+    return t + "f"
 
 
-VEC = 8   # floats per SIMD vector (8 x 32-bit = 256 bits)
+class WeightStore:
+    """Collects every weight array into one binary file (weights.bin).
+    The C code gets a pointer into one big array instead of millions of numbers as text."""
+
+    def __init__(self):
+        self.chunks = []
+        self.size = 0
+
+    def add(self, arr):
+        arr = np.ascontiguousarray(arr, dtype=np.float32).ravel()
+        offset = self.size
+        pad = (-arr.size) % 16                     # keep every array 64-byte aligned
+        self.chunks.append(arr)
+        if pad:
+            self.chunks.append(np.zeros(pad, np.float32))
+        self.size += arr.size + pad
+        return f"(WTS + {offset})"
+
+    def write(self, path):
+        data = np.concatenate(self.chunks) if self.chunks else np.zeros(1, np.float32)
+        data.tofile(path)
 
 
-def emit_conv_special(idx, node, graph):
-    """Write a Conv function made for ONE layer, fully unrolled by the compiler.
+def activation(node, var):
+    # C code that applies this node's fused activation to the scalar `var`
+    if node.op_type == "ConvRelu":
+        return f"if ({var} < 0.0f) {var} = 0.0f;"
+    if node.op_type == "ConvClip":
+        lo, hi = node.attributes["clip_min"], node.attributes["clip_max"]
+        code = ""
+        if lo != float("-inf"):
+            code += f"if ({var} < {cfloat(lo)}) {var} = {cfloat(lo)}; "
+        if hi != float("inf"):
+            code += f"if ({var} > {cfloat(hi)}) {var} = {cfloat(hi)};"
+        return code
+    return ""
 
-    The idea: for P neighbouring output pixels at once, keep all K running sums
-    in CPU registers as SIMD vectors (8 filters per vector). For each filter
-    tap we load the K weights once and reuse them for all P pixels.
-    Everything is written out as separate named variables (a0_0, a0_1, ...)
-    so gcc can't spill them back to memory.
-    """
-    x, w_name, b_name = node.inputs[0], node.inputs[1], node.inputs[2]
+
+def conv_params(node, graph):
+    x = node.inputs[0]
     _, C, H, W = graph.shapes[x]
     _, K, OH, OW = graph.shapes[node.outputs[0]]
-    w = graph.weights[w_name].astype(np.float32)          # [K][C][kh][kw]
-    _, _, KH, KW = w.shape
+    w = graph.weights[node.inputs[1]].astype(np.float32)
+    KH, KW = w.shape[2], w.shape[3]
     a = node.attributes
     pt, pl, pb, pr = a.get("pads", [0, 0, 0, 0])
     S = a.get("strides", [1, 1])[0]
+    if graph.shapes[x][0] != 1:
+        raise ValueError("only batch size 1 is supported")
+    if len(node.inputs) > 2 and node.inputs[2]:
+        b = graph.weights[node.inputs[2]].astype(np.float32)
+    else:
+        b = np.zeros(K, np.float32)
+    return C, H, W, K, OH, OW, w, b, KH, KW, pt, pl, pb, pr, S, a.get("group", 1)
+
+
+def padded_source(idx, C, H, W, pt, pl, pb, pr):
+    """Code that gives the layer a zero-padded copy of its input (or the input itself if no padding)."""
     HP, WP = H + pt + pb, W + pl + pr
-    relu = node.op_type == "ConvRelu"
+    if pt == pl == pb == pr == 0:
+        return HP, WP, "", "    const float *src = x;"
+    decl = f"static float PAD{idx}[{C * HP * WP}];   /* zero-padded copy of this layer's input */\n"
+    body = f"""    for (int c = 0; c < {C}; c++)                       /* copy input inside the zero border */
+        for (int h = 0; h < {H}; h++)
+            memcpy(&PAD{idx}[(c * {HP} + h + {pt}) * {WP} + {pl}], &x[(c * {H} + h) * {W}],
+                   {W} * sizeof(float));
+    const float *src = PAD{idx};"""
+    return HP, WP, decl, body
 
-    V = (K + VEC - 1) // VEC          # vectors needed to hold K filters
-    KP = V * VEC                      # K rounded up to a multiple of 8 (extra filters are zero)
 
-    # weights rearranged to [C][kh][kw][KP] so the filters for one tap sit together
-    packed = np.zeros((C, KH, KW, KP), np.float32)
-    packed[..., :K] = w.transpose(1, 2, 3, 0)
+def emit_conv_dense(idx, node, graph, ws):
+    """A Conv function for ONE normal (non-depthwise) layer.
+
+    Filters are handled in blocks of KB (8 or 16). For each block, we compute a
+    tile of P neighbouring output pixels x KB filters, keeping all P*KB running
+    sums in CPU registers as SIMD vectors. Each weight loaded is reused P times.
+    The code for a tile is written out fully unrolled by this Python code.
+    """
+    C, H, W, K, OH, OW, w, b, KH, KW, pt, pl, pb, pr, S, _ = conv_params(node, graph)
+    HP, WP, pad_decl, pad_body = padded_source(idx, C, H, W, pt, pl, pb, pr)
+
+    KB = VEC if K <= VEC else 2 * VEC         # filters per block
+    V = KB // VEC                             # vectors per block
+    NB = (K + KB - 1) // KB                   # number of filter blocks
+    KP = NB * KB                              # K rounded up (extra filters are zero)
+    T = C * KH * KW                           # filter taps
+
+    packed = np.zeros((NB, KB, C, KH, KW), np.float32)
+    packed.reshape(KP, C, KH, KW)[:K] = w
+    packed = packed.transpose(0, 2, 3, 4, 1)  # -> [NB][C][KH][KW][KB]
     bias = np.zeros(KP, np.float32)
-    bias[:K] = graph.weights[b_name]
+    bias[:K] = b
+    W_ptr, B_ptr = ws.add(packed), ws.add(bias)
 
-    P = max(1, 12 // V)               # pixels per tile, so P*V sums fit in registers
-    P = min(P, OW)
+    P = min(max(1, 12 // V), OW)              # pixels per tile
+    act = activation(node, "r")
 
     def tile(n):
-        # code that computes n output pixels starting at column ow0
         L = []
         for p in range(n):
             for v in range(V):
-                L.append(f"            v8 a{p}_{v} = LOADV(&BIAS{idx}[{v * VEC}]);")
-        L.append(f"            for (int t = 0; t < {C * KH * KW}; t++) {{")
+                L.append(f"            vf a{p}_{v} = LOADV(bias + {v * VEC});")
+        L.append(f"            for (int t = 0; t < {T}; t++) {{")
         L.append(f"                const int c = t / {KH * KW}, i = (t / {KW}) % {KH}, j = t % {KW};")
-        L.append(f"                const float *wk = &WP{idx}[t * {KP}];")
-        L.append(f"                const float *xr = &PAD{idx}[(c * {HP} + oh * {S} + i) * {WP} + ow0 * {S} + j];")
+        L.append(f"                const float *wk = wblk + t * {KB};")
+        L.append(f"                const float *xr = &src[(c * {HP} + oh * {S} + i) * {WP} + ow0 * {S} + j];")
         for v in range(V):
-            L.append(f"                v8 w{v} = LOADV(wk + {v * VEC});")
+            L.append(f"                vf w{v} = LOADV(wk + {v * VEC});")
         for p in range(n):
-            L.append(f"                v8 x{p} = SPLAT(xr[{p * S}]);")
+            L.append(f"                vf x{p} = SPLAT(xr[{p * S}]);")
             for v in range(V):
                 L.append(f"                a{p}_{v} += x{p} * w{v};")
         L.append("            }")
         for p in range(n):
             for v in range(V):
                 L.append(f"            STOREV(tmp, a{p}_{v});")
-                L.append(f"            for (int k = 0; k < {VEC}; k++) if ({v * VEC} + k < {K}) {{")
-                L.append(f"                float r = tmp[k];" + (" if (r < 0.0f) r = 0.0f;" if relu else ""))
-                L.append(f"                y[({v * VEC} + k) * {OH * OW} + oh * {OW} + ow0 + {p}] = r;")
+                L.append(f"            for (int k = 0; k < {VEC}; k++) {{")
+                L.append(f"                int kk = nb * {KB} + {v * VEC} + k;")
+                L.append(f"                if (kk >= {K}) break;")
+                L.append(f"                float r = tmp[k]; {act}")
+                L.append(f"                y[kk * {OH * OW} + oh * {OW} + ow0 + {p}] = r;")
                 L.append("            }")
         return "\n".join(L)
 
-    main_end = OW - OW % P
-    tail = OW % P
-    code = [f"""
+    main_end, tail = OW - OW % P, OW % P
+    code = f"""
 /* {node.op_type} layer {idx}: {C}x{H}x{W} -> {K}x{OH}x{OW}, {KH}x{KW} filter, stride {S}
-   tile = {P} output pixels x {KP} filters ({P * V} vector sums kept in registers) */
-static float PAD{idx}[{C * HP * WP}];                           /* zero-padded copy of the input */
-static const float WP{idx}[{packed.size}] = {{{", ".join(cf(v) for v in packed.ravel())}}};
-static const float BIAS{idx}[{KP}] = {{{", ".join(cf(v) for v in bias)}}};
-
-static void conv_layer{idx}(const float *x, float *y)
+   {NB} block(s) of {KB} filters, tile = {P} pixels x {KB} filters ({P * V} vector sums in registers) */
+{pad_decl}static void conv_layer{idx}(const float *x, float *y)
 {{
     float tmp[{VEC}];
-    for (int c = 0; c < {C}; c++)                                  /* copy input inside the border */
-        for (int h = 0; h < {H}; h++)
-            memcpy(&PAD{idx}[(c * {HP} + h + {pt}) * {WP} + {pl}], &x[(c * {H} + h) * {W}],
-                   {W} * sizeof(float));
-
-    for (int oh = 0; oh < {OH}; oh++) {{
-        for (int ow0 = 0; ow0 < {main_end}; ow0 += {P}) {{
+{pad_body}
+    for (int nb = 0; nb < {NB}; nb++) {{
+        const float *wblk = {W_ptr} + nb * {T * KB};
+        const float *bias = {B_ptr} + nb * {KB};
+        for (int oh = 0; oh < {OH}; oh++) {{
+            for (int ow0 = 0; ow0 < {main_end}; ow0 += {P}) {{
 {tile(P)}
-        }}"""]
+            }}"""
     if tail:
-        code.append(f"""        {{   /* last {tail} column(s) */
+        code += f"""
+            {{   /* last {tail} column(s) */
             const int ow0 = {main_end};
 {tile(tail)}
-        }}""")
-    code.append("    }\n}\n")
-    return "\n".join(code)
+            }}"""
+    code += "\n        }\n    }\n}\n"
+    return code
 
 
 
-def emit_gemm_special(idx, node, graph):
-    """Write a Gemm function for ONE layer. Weights are rearranged to [K][N] so
-    that for each input value we update all N output scores at once, using
-    SIMD vectors kept in registers (same trick as the Conv)."""
-    x, w_name, b_name = node.inputs[0], node.inputs[1], node.inputs[2]
+def vector_activation(node, var):
+    # C code that applies this node's fused activation to the whole vector `var`
+    if node.op_type == "ConvRelu":
+        return f"{var} = VMAX({var}, SPLAT(0.0f));"
+    if node.op_type == "ConvClip":
+        lo, hi = node.attributes["clip_min"], node.attributes["clip_max"]
+        code = ""
+        if lo != float("-inf"):
+            code += f"{var} = VMAX({var}, SPLAT({cfloat(lo)})); "
+        if hi != float("inf"):
+            code += f"{var} = VMIN({var}, SPLAT({cfloat(hi)}));"
+        return code
+    return ""
+
+
+MR = 6    # filters per micro-tile (the pixel side is 2 vectors)
+
+
+def emit_conv_1x1(idx, node, graph, ws):
+    """A 1x1 Conv is a matrix multiply: out[K][pixels] = W[K][C] x in[C][pixels].
+
+    Micro-tile of MR=6 filters x 2 vectors of pixels: 12 vector sums in registers.
+    For each input channel: load 2 vectors of pixels, broadcast 6 weights,
+    12 multiply-adds. Results are written a whole vector at a time, with the
+    activation applied to whole vectors.
+    Leftover pixels (when the image size isn't a multiple of the tile) are copied
+    into a small zero-padded block first, so they also use the fast tile."""
+    C, H, W, K, OH, OW, w, b, KH, KW, pt, pl, pb, pr, S, _ = conv_params(node, graph)
+    HW = H * W
+    NR = 2 * VEC                                              # pixels per micro-tile
+    NB = (K + MR - 1) // MR
+    KP = NB * MR
+    wpad = np.zeros((KP, C), np.float32)
+    wpad[:K] = w.reshape(K, C)
+    packed = wpad.reshape(NB, MR, C).transpose(0, 2, 1)       # -> [NB][C][MR]
+    bias = np.zeros(KP, np.float32)
+    bias[:K] = b
+    W_ptr, B_ptr = ws.add(packed), ws.add(bias)
+    act = vector_activation(node, "r")
+
+    def micro(xbase, xstride, ybase, ystride, check_k=True):
+        # MR filters x NR pixels. Input pixel q of channel c is xbase[c * xstride + q],
+        # output pixel q of filter k goes to ybase[k * ystride + q].
+        L = [f"            const float *wb = wall + nb * {C * MR};"]
+        for m in range(MR):
+            L.append(f"            vf a{m}_0 = SPLAT(ball[nb * {MR} + {m}]), a{m}_1 = a{m}_0;")
+        L.append(f"            for (int c = 0; c < {C}; c++) {{")
+        L.append(f"                const float *xc = {xbase} + c * {xstride};")
+        L.append(f"                vf x0 = LOADV(xc), x1 = LOADV(xc + {VEC});")
+        L.append(f"                const float *wc = wb + c * {MR};")
+        for m in range(MR):
+            L.append(f"                {{ vf wv = SPLAT(wc[{m}]); a{m}_0 += wv * x0; a{m}_1 += wv * x1; }}")
+        L.append("            }")
+        for m in range(MR):
+            guard = f"if (nb * {MR} + {m} < {K}) " if (check_k and K % MR) else ""
+            L.append(f"            {guard}{{ float *yk = {ybase} + (nb * {MR} + {m}) * {ystride};")
+            L.append(f"                vf r = a{m}_0; {act} STOREV(yk, r);")
+            L.append(f"                r = a{m}_1; {act} STOREV(yk + {VEC}, r); }}")
+        return "\n".join(L)
+
+    full, rest = HW - HW % NR, HW % NR
+    tail_decl = ""
+    if rest:
+        tail_decl = (f"static float TX{idx}[{C * NR}];       /* leftover input pixels, zero-padded */\n"
+                     f"static float TY{idx}[{KP * NR}];      /* leftover output pixels */\n")
+
+    code = f"""
+/* {node.op_type} 1x1 layer {idx}: {C}x{H}x{W} -> {K}x{OH}x{OW} (a {K}x{C} by {C}x{HW} matrix multiply)
+   micro-tile = {MR} filters x {NR} pixels, {VEC}-wide vectors */
+{tail_decl}static void conv_layer{idx}(const float *x, float *y)
+{{
+    const float *wall = {W_ptr}, *ball = {B_ptr};
+    for (int p = 0; p < {full}; p += {NR})
+        for (int nb = 0; nb < {NB}; nb++) {{
+{micro("x + p", HW, "y + p", HW)}
+        }}
+"""
+    if rest:
+        code += f"""
+    /* last {rest} pixel(s): copy into a zero-padded block, run the same tile, copy back */
+    for (int c = 0; c < {C}; c++)
+        memcpy(TX{idx} + c * {NR}, x + c * {HW} + {full}, {rest} * sizeof(float));
+    for (int nb = 0; nb < {NB}; nb++) {{
+{micro(f"TX{idx}", NR, f"TY{idx}", NR, check_k=False)}
+    }}
+    for (int k = 0; k < {K}; k++)
+        memcpy(y + k * {HW} + {full}, TY{idx} + k * {NR}, {rest} * sizeof(float));
+"""
+    code += "}\n"
+    return code
+
+
+def emit_conv_depthwise(idx, node, graph, ws):
+    """A Conv function for ONE depthwise layer: each channel has its own small filter.
+
+    One vector of neighbouring output pixels is computed at once. The KH*KW
+    weights of a channel are broadcast into registers once per channel.
+    Stride 2: each padded input row is split into its even and odd columns first,
+    so every load is a straight run of memory (no gathering every other value)."""
+    C, H, W, K, OH, OW, w, b, KH, KW, pt, pl, pb, pr, S, group = conv_params(node, graph)
+    if not (group == C == K):
+        raise ValueError(f"grouped Conv with group={group} not supported (only depthwise)")
+    if S not in (1, 2):
+        raise ValueError("depthwise stride must be 1 or 2")
+    HP, WP, pad_decl, pad_body = padded_source(idx, C, H, W, pt, pl, pb, pr)
+    W_ptr, B_ptr = ws.add(w.reshape(C, KH * KW)), ws.add(b)
+    vact, sact = vector_activation(node, "r"), activation(node, "s")
+
+    # where tap (i, j) of output pixel `ow` reads from, as (row array, offset)
+    if S == 1:
+        def tap(i, j):
+            return f"xc + (oh + {i}) * {WP} + ow + {j}"
+        prep = ""
+        decl = ""
+    else:
+        WE, WO = (WP + 1) // 2, WP // 2                       # even / odd column counts
+        decl = f"static float EV{idx}[{HP * WE}], OD{idx}[{HP * max(WO, 1)}];   /* even / odd columns */\n"
+        prep = f"""        for (int h = 0; h < {HP}; h++) {{                 /* split rows into even and odd columns */
+            const float *row = xc + h * {WP};
+            for (int q = 0; q < {WE}; q++) EV{idx}[h * {WE} + q] = row[2 * q];
+            for (int q = 0; q < {WO}; q++) OD{idx}[h * {WO} + q] = row[2 * q + 1];
+        }}
+"""
+        def tap(i, j):
+            arr, width = (f"EV{idx}", WE) if j % 2 == 0 else (f"OD{idx}", WO)
+            return f"{arr} + (2 * oh + {i}) * {width} + ow + {j // 2}"
+
+    T = KH * KW
+    wload = "\n".join(f"        const vf w{t} = SPLAT(wc[{t}]);" for t in range(T))
+    vec_taps = "\n".join(f"                acc += LOADV({tap(i, j)}) * w{i * KW + j};"
+                         for i in range(KH) for j in range(KW))
+    sc_taps = "\n".join(f"                s += *({tap(i, j)}) * wc[{i * KW + j}];"
+                        for i in range(KH) for j in range(KW))
+    vec_end = OW - OW % VEC
+
+    return f"""
+/* {node.op_type} depthwise layer {idx}: {C}x{H}x{W} -> {K}x{OH}x{OW}, {KH}x{KW} filter, stride {S} */
+{pad_decl}{decl}static void conv_layer{idx}(const float *x, float *y)
+{{
+{pad_body}
+    const float *wall = {W_ptr}, *wb = {B_ptr};
+    for (int c = 0; c < {C}; c++) {{
+        const float *xc = src + c * {HP * WP};
+        const float *wc = wall + c * {T};
+        float *yc = y + c * {OH * OW};
+        const vf bias = SPLAT(wb[c]);
+{wload}
+{prep}        for (int oh = 0; oh < {OH}; oh++) {{
+            int ow = 0;
+            for (; ow < {vec_end}; ow += {VEC}) {{           /* a vector of output pixels at once */
+                vf acc = bias;
+{vec_taps}
+                vf r = acc; {vact}
+                STOREV(yc + oh * {OW} + ow, r);
+            }}
+            for (; ow < {OW}; ow++) {{                         /* leftover pixels */
+                float s = wb[c];
+{sc_taps}
+                {sact}
+                yc[oh * {OW} + ow] = s;
+            }}
+        }}
+    }}
+}}
+"""
+
+
+def emit_gemm(idx, node, graph, ws):
+    """A Gemm function for ONE layer. Weights are rearranged so that each input
+    value updates a block of up to 64 outputs at once, using SIMD vectors in registers."""
+    x = node.inputs[0]
+    if graph.shapes[x][0] != 1 or node.attributes.get("transA", 0):
+        raise ValueError("only Gemm with one input row is supported")
     K = graph.shapes[x][1]
     N = graph.shapes[node.outputs[0]][1]
-    w = graph.weights[w_name].astype(np.float32)
+    w = graph.weights[node.inputs[1]].astype(np.float32)
     if not node.attributes.get("transB", 0):
-        w = w.T                                            # make it [N][K]
-    V = (N + VEC - 1) // VEC
-    NP = V * VEC
-    packed = np.zeros((K, NP), np.float32)
-    packed[:, :N] = w.T                                    # -> [K][NP]
+        w = w.T                                              # -> [N][K]
+    w = w * node.attributes.get("alpha", 1.0)
+    b = graph.weights[node.inputs[2]].astype(np.float32).ravel() * node.attributes.get("beta", 1.0)
+
+    VB = min(8, (N + VEC - 1) // VEC)                       # vectors per block (up to 64 outputs)
+    NBK = VB * VEC
+    NB = (N + NBK - 1) // NBK
+    NP = NB * NBK
+    wpad = np.zeros((NP, K), np.float32)
+    wpad[:N] = w
+    packed = wpad.reshape(NB, NBK, K).transpose(0, 2, 1)    # -> [NB][K][NBK]
     bias = np.zeros(NP, np.float32)
-    bias[:N] = graph.weights[b_name]
+    bias[:N] = b
+    W_ptr, B_ptr = ws.add(packed), ws.add(bias)
 
     L = [f"""
-/* Gemm layer {idx}: {K} inputs -> {N} outputs, all {N} outputs updated together */
-static const float GW{idx}[{packed.size}] = {{{", ".join(cf(v) for v in packed.ravel())}}};
-static const float GB{idx}[{NP}] = {{{", ".join(cf(v) for v in bias)}}};
-
+/* Gemm layer {idx}: {K} inputs -> {N} outputs, in {NB} block(s) of {NBK} outputs */
 static void gemm_layer{idx}(const float *x, float *y)
 {{
-    float tmp[{NP}];"""]
-    for v in range(V):
-        L.append(f"    v8 a{v} = LOADV(&GB{idx}[{v * VEC}]);")
-    L.append(f"    for (int k = 0; k < {K}; k++) {{")
-    L.append("        v8 xk = SPLAT(x[k]);")
-    for v in range(V):
-        L.append(f"        a{v} += xk * LOADV(&GW{idx}[k * {NP} + {v * VEC}]);")
-    L.append("    }")
-    for v in range(V):
-        L.append(f"    STOREV(&tmp[{v * VEC}], a{v});")
-    L.append(f"    memcpy(y, tmp, {N} * sizeof(float));\n}}\n")
+    float tmp[{NBK}];
+    for (int nb = 0; nb < {NB}; nb++) {{
+        const float *wblk = {W_ptr} + nb * {K * NBK};
+        const float *bias = {B_ptr} + nb * {NBK};"""]
+    for v in range(VB):
+        L.append(f"        vf a{v} = LOADV(bias + {v * VEC});")
+    L.append(f"        for (int k = 0; k < {K}; k++) {{")
+    L.append("            vf xk = SPLAT(x[k]);")
+    for v in range(VB):
+        L.append(f"            a{v} += xk * LOADV(wblk + k * {NBK} + {v * VEC});")
+    L.append("        }")
+    for v in range(VB):
+        L.append(f"        STOREV(&tmp[{v * VEC}], a{v});")
+    L.append(f"""        int n = {N} - nb * {NBK};
+        memcpy(y + nb * {NBK}, tmp, (n < {NBK} ? n : {NBK}) * sizeof(float));
+    }}
+}}
+""")
     return "\n".join(L)
 
 
-def generate_c(graph, assignment, buffers, kernel="special"):
+def generate_c(graph, assignment, buffers, kernel, weights_file, ws):
     numel = lambda name: math.prod(graph.shapes[name])
     buf = lambda name: f"B{assignment[name]}"
-
-    # only Conv/Gemm weights get emitted (Reshape's shape constant isn't needed at runtime)
-    used = []
-    for node in graph.nodes:
-        if node.op_type in ("Conv", "ConvRelu", "Gemm"):
-            for name in node.inputs[1:]:
-                if kernel == "special":
-                    continue                      # written packed, inside the layer's own function
-                if name not in used:
-                    used.append(name)
-
-    out = ["/* generated by codegenerator.py -- do not edit by hand */", KERNELS]
-    out.append("/* ---------- weights ---------- */")
-    out.append(emit_weights(graph, used))
-
-    if kernel == "special":
-        out.append("\n/* ---------- one specialized function per Conv / Gemm layer ---------- */")
-        for idx, node in enumerate(graph.nodes):
-            if node.op_type in ("Conv", "ConvRelu"):
-                out.append(emit_conv_special(idx, node, graph))
-            elif node.op_type == "Gemm":
-                out.append(emit_gemm_special(idx, node, graph))
-
-    out.append("\n/* ---------- buffers from the memory planner ---------- */")
-    for i, nbytes in enumerate(buffers):
-        out.append(f"static float B{i}[{nbytes // 4}];   /* {nbytes} bytes */")
-
+    splat = "static inline vf SPLAT(float f) { vf v = {" + ", ".join(["f"] * VEC) + "}; return v; }"
+    out = ["/* generated by codegenerator.py -- do not edit by hand */",
+           f"#define VEC_WIDTH {VEC}", KERNELS.replace("SPLAT_DEFINITION", splat)]
+    layer_code = []
     body = []
+
     in_name, out_name = graph.inputs[0], graph.outputs[0]
     body.append(f"    memcpy({buf(in_name)}, input, {numel(in_name)} * sizeof(float));")
 
-    for node in graph.nodes:
+    for idx, node in enumerate(graph.nodes):
         x, y = node.inputs[0], node.outputs[0]
         xs, ys = graph.shapes[x], graph.shapes[y]
         a = node.attributes
         body.append(f"\n    /* {node.op_type}: {x} {xs} -> {y} {ys} */")
+        op = node.op_type
 
-        if node.op_type in ("Conv", "ConvRelu") and kernel == "special":
-            idx = graph.nodes.index(node)
+        if op in ("Conv", "ConvRelu", "ConvClip") and kernel == "special":
+            w_shape = graph.shapes[node.inputs[1]]
+            is_1x1 = (w_shape[2] == w_shape[3] == 1 and a.get("strides", [1, 1]) == [1, 1]
+                      and not any(a.get("pads", [0, 0, 0, 0])))
+            if a.get("group", 1) == 1 and is_1x1:
+                layer_code.append(emit_conv_1x1(idx, node, graph, ws))
+            elif a.get("group", 1) == 1:
+                layer_code.append(emit_conv_dense(idx, node, graph, ws))
+            else:
+                layer_code.append(emit_conv_depthwise(idx, node, graph, ws))
             body.append(f"    conv_layer{idx}({buf(x)}, {buf(y)});")
 
-        elif node.op_type in ("Conv", "ConvRelu"):
-            w, b = node.inputs[1], node.inputs[2]
-            ws = graph.shapes[w]
+        elif op in ("Conv", "ConvRelu"):                   # original kernels (naive / fast)
+            if a.get("group", 1) != 1:
+                raise ValueError("depthwise Conv needs kernel='special'")
+            w_name, b_name = node.inputs[1], node.inputs[2]
+            layer_code.append(f"#define {c_name(w_name)} {ws.add(graph.weights[w_name])}")
+            layer_code.append(f"#define {c_name(b_name)} {ws.add(graph.weights[b_name])}")
+            ws_shape = graph.shapes[w_name]
             pads = a.get("pads", [0, 0, 0, 0])
             stride = a.get("strides", [1, 1])[0]
-            fused = 1 if node.op_type == "ConvRelu" else 0
             body.append(f"    CONV({buf(x)}, {xs[1]}, {xs[2]}, {xs[3]}, "
-                        f"{c_name(w)}, {c_name(b)}, {ws[0]}, {ws[2]}, {ws[3]}, "
-                        f"{pads[0]}, {pads[1]}, {stride}, {fused}, "
+                        f"{c_name(w_name)}, {c_name(b_name)}, {ws_shape[0]}, {ws_shape[2]}, {ws_shape[3]}, "
+                        f"{pads[0]}, {pads[1]}, {stride}, {1 if op == 'ConvRelu' else 0}, "
                         f"{buf(y)}, {ys[2]}, {ys[3]});")
 
-        elif node.op_type == "Relu":
-            body.append(f"    relu({buf(x)}, {numel(x)}, {buf(y)});")
+        elif op == "Gemm" and kernel == "special":
+            layer_code.append(emit_gemm(idx, node, graph, ws))
+            body.append(f"    gemm_layer{idx}({buf(x)}, {buf(y)});")
 
-        elif node.op_type == "MaxPool":
+        elif op == "Gemm":
+            w_name, b_name = node.inputs[1], node.inputs[2]
+            layer_code.append(f"#define {c_name(w_name)} {ws.add(graph.weights[w_name])}")
+            layer_code.append(f"#define {c_name(b_name)} {ws.add(graph.weights[b_name])}")
+            body.append(f"    gemm({buf(x)}, {xs[1]}, {c_name(w_name)}, {c_name(b_name)}, "
+                        f"{ys[1]}, {a.get('transB', 0)}, {buf(y)});")
+
+        elif op == "Relu":
+            body.append(f"    for (int i = 0; i < {numel(x)}; i++) "
+                        f"{{ float r = {buf(x)}[i]; if (r < 0.0f) r = 0.0f; {buf(y)}[i] = r; }}")
+
+        elif op == "Clip":
+            lo, hi = clip_bounds(node, graph)
+            body.append(f"    for (int i = 0; i < {numel(x)}; i++) {{ float r = {buf(x)}[i]; "
+                        f"if (r < {cfloat(lo)}) r = {cfloat(lo)}; if (r > {cfloat(hi)}) r = {cfloat(hi)}; "
+                        f"{buf(y)}[i] = r; }}")
+
+        elif op == "Add":
+            x2 = node.inputs[1]
+            if graph.shapes[x2] != xs:
+                raise ValueError("Add with broadcasting not supported yet")
+            body.append(f"    for (int i = 0; i < {numel(x)}; i++) "
+                        f"{buf(y)}[i] = {buf(x)}[i] + {buf(x2)}[i];")
+
+        elif op == "MaxPool":
             k = a["kernel_shape"][0]
             stride = a.get("strides", a["kernel_shape"])[0]
             body.append(f"    maxpool2d({buf(x)}, {xs[1]}, {xs[2]}, {xs[3]}, {k}, {stride}, "
                         f"{buf(y)}, {ys[2]}, {ys[3]});")
 
-        elif node.op_type == "Reshape":
+        elif op in ("ReduceMean", "GlobalAveragePool"):
+            if op == "ReduceMean":
+                from ir import reduce_axes
+                if reduce_axes(node, graph, len(xs)) != [2, 3]:
+                    raise ValueError("ReduceMean only supported over height and width")
+            hw = xs[2] * xs[3]
+            body.append(f"    for (int c = 0; c < {xs[1]}; c++) {{ float s = 0.0f; "
+                        f"for (int i = 0; i < {hw}; i++) s += {buf(x)}[c * {hw} + i]; "
+                        f"{buf(y)}[c] = s / {hw}.0f; }}")
+
+        elif op in ("Reshape", "Flatten"):
             # same numbers, new layout: just copy if the planner gave it a different buffer
             if buf(x) != buf(y):
                 body.append(f"    memcpy({buf(y)}, {buf(x)}, {numel(x)} * sizeof(float));")
 
-        elif node.op_type == "Gemm" and kernel == "special":
-            idx = graph.nodes.index(node)
-            body.append(f"    gemm_layer{idx}({buf(x)}, {buf(y)});")
-
-        elif node.op_type == "Gemm":
-            w, b = node.inputs[1], node.inputs[2]
-            trans_b = a.get("transB", 0)
-            body.append(f"    gemm({buf(x)}, {xs[1]}, {c_name(w)}, {c_name(b)}, "
-                        f"{ys[1]}, {trans_b}, {buf(y)});")
-
         else:
-            raise ValueError("No C code for op: " + node.op_type)
+            raise ValueError("No C code for op: " + op)
 
     body.append(f"\n    memcpy(output, {buf(out_name)}, {numel(out_name)} * sizeof(float));")
 
+    # all weights live in one array, loaded from weights.bin the first time the model runs
+    path = Path(weights_file).resolve().as_posix().replace('"', '\\"')
+    out.append(f"""
+/* ---------- weights: {ws.size:,} floats, loaded from a file ---------- */
+#define WEIGHTS_FILE "{path}"
+static float WTS[{max(ws.size, 1)}];
+
+static void load_weights(void)
+{{
+    FILE *f = fopen(WEIGHTS_FILE, "rb");
+    if (!f || fread(WTS, sizeof(float), {max(ws.size, 1)}, f) != {max(ws.size, 1)}) {{
+        fprintf(stderr, "could not load weights from %s\\n", WEIGHTS_FILE);
+        exit(1);
+    }}
+    fclose(f);
+}}
+""")
+    out.append("/* ---------- one function per layer ---------- */")
+    out.extend(layer_code)
+    out.append("\n/* ---------- buffers from the memory planner ---------- */")
+    for i, nbytes in enumerate(buffers):
+        out.append(f"static float B{i}[{nbytes // 4}];   /* {nbytes:,} bytes */")
+
     out.append("\n/* ---------- the model, one step per node ---------- */")
     out.append("void model_run(const float *input, float *output)\n{")
+    out.append("    static int loaded = 0;\n    if (!loaded) { load_weights(); loaded = 1; }\n")
     out.extend(body)
     out.append("}")
     return "\n".join(out) + "\n"
 
 
 def build(model_path, build_dir, fast=True, exe_name="model.exe", kernel=None):
-    # kernel: "naive" (original), "fast" (row-sweep), "special" (per-layer, all filters at once)
+    # kernel: "naive" (original), "fast" (row-sweep), "special" (per-layer SIMD)
     if kernel is None:
         kernel = "special" if fast else "naive"
+    global VEC
+    VEC = detect_vector_width()
     graph = from_onnx(model_path)
-    infer_shapes(graph, (1, 1, 28, 28))
-    fuse_conv_relu(graph)
+    infer_shapes(graph)
+    fuse_conv_activation(graph)
     assignment, buffers, lifetimes = plan_memory(graph)
     check_plan(assignment, lifetimes)
 
+    build_dir = Path(build_dir)
     build_dir.mkdir(exist_ok=True)
     in_size = math.prod(graph.shapes[graph.inputs[0]])
     out_size = math.prod(graph.shapes[graph.outputs[0]])
 
-    (build_dir / "model.c").write_text(generate_c(graph, assignment, buffers, kernel))
+    # each program gets its own weights file (the kernels store weights in different layouts)
+    weights_file = build_dir / (Path(exe_name).stem + "_weights.bin")
+    ws = WeightStore()
+    (build_dir / "model.c").write_text(generate_c(graph, assignment, buffers, kernel, weights_file, ws))
+    ws.write(weights_file)
+
     main = MAIN_C.replace("INPUT_SIZE", str(in_size)).replace("OUTPUT_SIZE", str(out_size))
     (build_dir / "main.c").write_text(main)
 
